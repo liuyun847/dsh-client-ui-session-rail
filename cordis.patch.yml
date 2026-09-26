@@ -1,0 +1,7 @@
+# dsh-client-ui-session-rail 的 profile 层 patch。
+# 宿主侧本插件没有行为(一切都在浏览器半侧:座位注册 + 渲染),这一行只为让
+# 客户端模块被加载器发现(包内 dsh.client 声明 platform: web)。
+# 行 id `session-rail` 是插件页开关与诊断的寻址键,勿改。
+- insert:
+    - id: session-rail
+      name: 'dsh-client-ui-session-rail'
