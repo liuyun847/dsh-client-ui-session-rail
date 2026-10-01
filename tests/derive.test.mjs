@@ -7,6 +7,10 @@
  * 通过 __test 导出直接测纯逻辑(不渲染任何组件);apply 用假 ctx 走一遍注册路径,
  * 这样"刷新页面才发现 apply 抛错"的坑能在本地先拦住。
  *
+ * 渲染层用例分两档:无状态桩(reactStub)只够断言"处理函数挂上了没";
+ * 需要跨渲染的用例(详情卡在横条消失后要收掉)走 mountRail —— 带 hook 槽位、
+ * 能重复渲染并冲刷 effect 的最小 harness,见「渲染层:横条的鼠标契约」一节。
+ *
  * 运行:node tests/derive.test.mjs
  */
 const CLIENT_PATH = new URL("../lib/client.js", import.meta.url);
@@ -51,10 +55,13 @@ function walk(node, visit) {
   walk(node.children, visit);
 }
 
+/** 当前生效的 react 桩:默认无状态;mountRail 渲染期间换成带 hook 槽位的 harness。 */
+let activeReact = reactStub;
+
 function loadModule() {
   if (definition === undefined) throw new Error("client.js 未通过 window.__ModuleLoader__.load 注册定义");
   return definition.factory((spec) => {
-    if (spec === "react") return reactStub;
+    if (spec === "react") return activeReact;
     throw new Error("未预期的 require: " + spec);
   });
 }
@@ -556,6 +563,278 @@ test("横条:浮层入口挂在 shell.overlay,容器带 group 与栏名", () => 
   equal(tree.props.role, "group");
   equal(tree.props["aria-label"], "rail.label", "桩 t 原样返回 key");
   if (!String(tree.props.className).includes("sr-frame")) throw new Error("缺 sr-frame 类:" + tree.props.className);
+});
+
+// ── 渲染层:详情卡的生命周期(需要跨渲染的 hook 状态)────────────────────
+/**
+ * 假 DOM 元素:详情卡定位要读 getBoundingClientRect(横条自身与栏框各一次)。
+ * @param {{top:number,height:number}} rect - 视口坐标矩形。
+ * @returns {object} 带 getBoundingClientRect 的桩元素。
+ */
+function fakeElement(rect) {
+  return { getBoundingClientRect: () => ({ top: rect.top, height: rect.height, left: 0, right: 56, bottom: rect.top + rect.height, width: 56 }) };
+}
+
+/**
+ * 带 hook 槽位的最小渲染 harness:函数组件就地展开、hook 按"组件路径"跨渲染复用,
+ * effect 在提交后按依赖数组决定跑不跑,effect 里排队的 setState 在返回前再刷一遍。
+ * 无状态桩(reactStub)测不了"重新渲染一次之后卡片还在不在",这里补齐。
+ * 用法:createHookHarness() → 设 harness.factory/props → harness.render()(可重复调用)。
+ * @returns {{render: Function, unmount: Function}} 渲染器(render 可重复调用)。
+ */
+function createHookHarness() {
+  const harness = { props: {}, renders: 0, refs: [] };
+  // 槽位按"组件路径"跨渲染复用:路径 = 从根到该组件的子序号链(React 靠 fiber 树做同一件事)。
+  // 用字符串当 key,数组会因中间组件条件渲染 null 而错位。
+  const slotStore = new Map();
+  const prev = { hooks: [], effectStates: [] };
+  let current = null;
+
+  /** 取当前组件的 hook 槽位数组:根组件固定用同一份,子组件按路径取。 */
+  const slotsFor = () => {
+    if (current.path === "") return current.slots;
+    let slots = slotStore.get(current.path);
+    if (slots === undefined) {
+      slots = [];
+      slotStore.set(current.path, slots);
+    }
+    return slots;
+  };
+  /** 槽位值按索引取;缺席时用工厂造一个(React 的 hook 顺序契约)。 */
+  const slotAt = (make) => {
+    const slots = slotsFor();
+    const index = current.cursor++;
+    if (slots[index] === undefined) slots[index] = make();
+    return slots[index];
+  };
+  /** deps 比较:同一渲染位置、同长度、逐项 Object.is。 */
+  const sameDeps = (a, b) => Array.isArray(a) && Array.isArray(b) && a.length === b.length && a.every((value, index) => Object.is(value, b[index]));
+
+  const bag = {
+    useState(value) {
+      const slot = slotAt(() => ({ value }));
+      const setter = (next) => {
+        const resolved = typeof next === "function" ? next(slot.value) : next;
+        if (Object.is(resolved, slot.value)) return;
+        slot.value = resolved;
+        // 不立刻重渲:真实 React 把 effect 里的 setState 攒到提交之后再刷一遍,
+        // 浏览器那一帧看到的是刷新后的结果(harness.render 的收尾循环负责这一遍)。
+        harness.pending = true;
+      };
+      return [slot.value, setter];
+    },
+    useRef(value) {
+      const slot = slotAt(() => ({ current: value }));
+      harness.refs.push(slot);
+      return slot;
+    },
+    useMemo(compute, deps) {
+      const slot = slotAt(() => ({ value: undefined, deps: undefined }));
+      if (slot.deps !== undefined && sameDeps(slot.deps, deps)) return slot.value;
+      slot.value = compute();
+      slot.deps = deps;
+      return slot.value;
+    },
+    useEffect(effect, deps) {
+      // 没有渲染上下文时(探针由用例手动调、且不在 render 里)按"已挂载"处理:直接跑一次。
+      if (current === null) {
+        effect();
+        return;
+      }
+      current.effects.push({ effect, deps });
+    },
+    createElement(type, props, children) {
+      const list = children === undefined ? [] : (Array.isArray(children) ? children : [children]);
+      const element = { type, props: props ?? {}, children: list };
+      if (typeof type !== "function") return element;
+      // 函数组件就地展开:给它一个自己的 hook 上下文,把 effect 冒泡到父级统一冲刷。
+      const saved = current;
+      const childIndex = saved === null ? 0 : saved.childIndex++;
+      const component = {
+        parent: saved,
+        path: saved === null ? "" : (saved.path === "" ? String(childIndex) : saved.path + "." + childIndex),
+        childIndex: 0,
+        effects: [],
+        slots: saved === null ? prev.hooks : [],
+        cursor: 0,
+      };
+      current = component;
+      const rendered = type(element.props);
+      current = saved;
+      if (saved !== null) saved.effects.push(...component.effects);
+      return rendered;
+    },
+  };
+  bag.useLayoutEffect = bag.useEffect;
+  // 模块在 factory 执行时就抓住 require("react") 的返回值,所以换桩必须早于 loadModule,
+  // 且渲染期间一直生效(渲染是同步的,包装器里换回来即可)。
+  bag.activate = () => { activeReact = bag; };
+  bag.deactivate = () => { activeReact = reactStub; };
+  harness.withHooks = (run) => {
+    bag.activate();
+    try {
+      return run();
+    } finally {
+      bag.deactivate();
+    }
+  };
+
+  harness.render = () => {
+    const component = { parent: null, path: "", childIndex: 0, effects: [], slots: prev.hooks, cursor: 0 };
+    current = component;
+    harness.refs.length = 0;
+    const tree = harness.factory(harness.props);
+    current = null;
+    harness.renders += 1;
+    // effect 在渲染提交之后跑;deps 不变就跳过(不传 deps = 每次都跑)。
+    const states = prev.effectStates;
+    component.effects.forEach((entry, index) => {
+      const previous = states[index];
+      if (previous !== undefined && entry.deps !== undefined && sameDeps(previous.deps, entry.deps)) return;
+      if (previous !== undefined && typeof previous.cleanup === "function") previous.cleanup();
+      states[index] = { deps: entry.deps, cleanup: entry.effect() };
+    });
+    return tree;
+  };
+  harness.setProps = (next) => { Object.assign(harness.props, next); };
+  harness.unmount = () => {
+    for (const state of prev.effectStates) if (typeof state.cleanup === "function") state.cleanup();
+  };
+  /** 渲染提交后的钩子(桩里没有 DOM,用例靠它补上 ref.current)。 */
+  harness.afterRender = () => {};
+  const rawRender = harness.render;
+  harness.render = () => {
+    bag.activate();
+    try {
+      let tree = rawRender();
+      harness.afterRender();
+      // effect 里排队的 setState 在浏览器绘制前再刷一遍(React 的提交后刷新),
+      // 最多 20 遍兜底,防止用例里写出自激循环时静默卡死。
+      let guard = 0;
+      while (harness.pending === true && guard < 20) {
+        harness.pending = false;
+        tree = rawRender();
+        harness.afterRender();
+        guard += 1;
+      }
+      harness.pending = false;
+      return tree;
+    } finally {
+      bag.deactivate();
+    }
+  };
+  return harness;
+}
+
+/**
+ * 装一次横条栏并返回可控渲染器:探针先发布"已收起",再用标准 props 渲染浮层。
+ * props 里的 useSessionStatus 每次渲染都读 railProps 的 statuses 字段,
+ * 所以用例改数据后 render() 一次即可看到新状态(等价于宿主推了一次新快照)。
+ * @param {object} props - 标准 props。
+ * @returns {{render: Function, marks: Function, preview: Function}} 渲染器与查询器。
+ */
+function mountRail(props) {
+  // 模块在 factory 执行时就抓住 require("react"),所以换桩必须早于 loadModule。
+  const harness = createHookHarness();
+  let instance;
+  harness.withHooks(() => { instance = loadModule(); });
+  const entry = fakeContext();
+  instance.apply(entry.ctx);
+  entry.registrations.find((row) => row.opts.name === "sidebar.footer.action").component({ wide: false });
+  const overlay = entry.registrations.find((row) => row.opts.name === "shell.overlay");
+  harness.factory = (renderProps) => overlay.component(renderProps);
+  harness.props = props;
+  // 桩里没有真 DOM:栏框的 ref 得手动补上,否则详情卡定位读不到 getBoundingClientRect
+  // (真实浏览器里 React 会填好它,所以这只是补宿主事实,不是给被测代码开后门)。
+  // 探针的 ref 在 render 期就传了初值 {current:null}(reactStub 语义),只有栏框这个
+  // useRef(null) 的槽位是真 null,所以按 current === null 就能唯一定位到它。
+  const frame = fakeElement({ top: 60, height: 400 });
+  harness.afterRender = () => {
+    // 探针的 ref 在 render 期就带了初值(reactStub 语义),只有栏框那个 useRef(null)
+    // 的槽位 current 仍是 null,按这个条件就能唯一定位到它。
+    for (const ref of harness.refs) if (ref.current === null) ref.current = frame;
+  };
+  return {
+    render: () => harness.render(),
+    marks(tree) {
+      const buttons = [];
+      walk(tree, (node) => {
+        if (node.type === "button") buttons.push(node);
+      });
+      return buttons;
+    },
+    preview(tree) {
+      let found = null;
+      walk(tree, (node) => {
+        if (node.type === "div" && node.props.role === "tooltip") found = node;
+      });
+      return found;
+    },
+  };
+}
+
+/**
+ * 造 mountRail 的标准 props:一行"已完成未读" + 一行"运行中"。
+ * 返回的 data.statuses 可整份换掉,模拟宿主推新快照(例如点击跳转后清掉未读标记)。
+ * @returns {{statuses: Map, props: object}} 可改的数据与对应 props。
+ */
+function railProps() {
+  const list = listOf(summary("done-session"), summary("run-session", { running: true }));
+  const data = { statuses: statusesOf({ "done-session": { running: false, completionUnread: true }, "run-session": { running: true, completionUnread: false } }) };
+  data.props = {
+    useSessions: (select) => select(list),
+    useSessionStatus: (select) => select(data.statuses),
+    useWorkspaces: (select) => select({ items: [] }),
+    t: (key) => key,
+    openSession: () => {},
+  };
+  return data;
+}
+
+test("详情卡:横条还在时照常出卡(基线,防止守卫收得太狠)", () => {
+  const data = railProps();
+  const rail = mountRail(data.props);
+  const tree = rail.render();
+  const marks = rail.marks(tree);
+  equal(marks.length, 2, "两条活跃会话");
+  equal(rail.preview(tree), null, "还没悬停时没有卡片");
+  marks[0].props.onPointerEnter({ currentTarget: fakeElement({ top: 100, height: 10 }) });
+  const hovered = rail.render();
+  const card = rail.preview(hovered);
+  if (card === null) throw new Error("悬停后没出详情卡");
+  const hoveredMark = rail.marks(hovered)[0];
+  if (!String(hoveredMark.props.className).includes("sr-mark--preview")) throw new Error("悬停中的横条没进预览态:" + hoveredMark.props.className);
+  equal(card.props.id, hoveredMark.props["aria-describedby"], "卡片 id 与横条的 aria-describedby 对齐");
+});
+
+test("详情卡:被悬停的横条消失后必须一起收掉(实测 bug:点绿色横条跳转后卡片留存)", () => {
+  const data = railProps();
+  const rail = mountRail(data.props);
+  const marks = rail.marks(rail.render());
+  marks[0].props.onPointerEnter({ currentTarget: fakeElement({ top: 100, height: 10 }) });
+  if (rail.preview(rail.render()) === null) throw new Error("前置条件不成立:悬停后应有卡片");
+
+  // 点击跳转的等效后果:该会话成为主视图 ⇒ completionUnread 被清 ⇒ 横条从行里消失。
+  // 指针仍压在那根已卸载的横条上,浏览器不会再给 React 发 pointerleave。
+  data.statuses = statusesOf({ "done-session": { running: false, completionUnread: false }, "run-session": { running: true, completionUnread: false } });
+  const after = rail.render();
+  equal(rail.marks(after).length, 1, "绿色横条已消失,只剩运行中那条");
+  equal(rail.preview(after), null, "卡片必须跟着消失,不能挂着一根不存在的横条");
+});
+
+test("详情卡:横条只是换档(仍在栏里)时卡片保留", () => {
+  const data = railProps();
+  const rail = mountRail(data.props);
+  const marks = rail.marks(rail.render());
+  marks[0].props.onPointerEnter({ currentTarget: fakeElement({ top: 100, height: 10 }) });
+  rail.render();
+  // 同一条会话重新跑起来:横条换档(绿→蓝)但没消失,卡片不该闪没。
+  data.statuses = statusesOf({ "done-session": { running: true, completionUnread: false }, "run-session": { running: true, completionUnread: false } });
+  const after = rail.render();
+  const buttons = rail.marks(after);
+  equal(buttons.length, 2, "两条都还在栏里");
+  if (rail.preview(after) === null) throw new Error("横条没消失时卡片不该被收掉");
+  if (!String(buttons[1].props.className).includes("sr-mark--running")) throw new Error("换档后应变成运行中档:" + buttons[1].props.className);
 });
 
 // ── 汇总 ────────────────────────────────────────────────────────────

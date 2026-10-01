@@ -1,26 +1,27 @@
 ---
-description: "DSH Web 客户端插件:侧边栏收起时,在左侧 56px 轨道的空白区竖排显示活跃会话横条(阻塞→已完成未读→运行中),悬停出详情卡,点击跳转"
+description: "DSH 客户端插件:侧边栏收起时在左侧显示活跃会话横条(阻塞→已完成未读→运行中,三色);dsh web 落在 56px 图标轨道里,Windows 桌面端落在内容区左边缘的浮层里"
 kind: "plugin"
 ---
 
 # dsh-client-ui-session-rail
 
-侧边栏收起(56px 图标轨道)时,在左侧空白区竖排显示"活跃会话"横条。
+侧边栏收起时,在左侧竖排显示"活跃会话"横条。两种落脚形态(按 `<html>` 平台标记自动选):
 
 ```
-┌──────────┐
-│   🐟     │  ← 品牌/收起按钮
-│   ＋     │
-│   ✦      │
-│   🔍     │
-│          │
-│   ▬▬     │ ← 阻塞(琥珀)      ┐
-│   ▬▬     │ ← 阻塞              │ 本插件渲染的横条栏
-│   ▬▬     │ ← 已完成未读(绿)    │ (垂直居中,最多 420px,超出内部滚动)
-│   ▬▬     │ ← 运行中(蓝,呼吸)  ┘
-│          │
-│   ⚙      │  ← 设置
-└──────────┘
+轨道形态(dsh web 浏览器)          浮层形态(Windows 标题栏桌面)
+┌──────────┐                      ┌──────────────────────────────┐
+│   🐟     │  ← 品牌/收起按钮      │ 应用 编辑        ─ □ ✕      │ ← 40px 标题栏
+│   ＋     │                      │ ▬▬  4. 要注意的代价          │
+│   ✦      │                      │ ▬▬                           │
+│   🔍     │                      │ ▬▬  正文…                    │
+│          │                      │ ▬▬                           │
+│   ▬▬     │ ← 阻塞(琥珀)        │ ▬▬  ← 24px 窄浮层压左留白   │
+│   ▬▬     │ ← 阻塞                │                              │
+│   ▬▬     │ ← 已完成未读(绿)      │                              │
+│   ▬▬     │ ← 运行中(蓝,呼吸)    │                              │
+│          │                      │                              │
+│   ⚙      │  ← 设置              │                              │
+└──────────┘                      └──────────────────────────────┘
 ```
 
 - **顺序**:阻塞 → 已完成未读 → 运行中,同档按最近更新倒序。
@@ -48,10 +49,13 @@ running 先看状态快照、再看目录行(与 ui-workspace 的 runningChildCo
 
 1. `sidebar.footer.action`(ui-sidebar 声明的 root 级 list 座位)——它的 owner props 带 `wide`,
    这是框架给插件看"侧边栏是否收起"的唯一正规通道。本插件在那里注册一个**不渲染 DOM 的探针**,
-   把 `wide` 发布到模块内的折叠态源。
+   把 `wide` 发布到模块内的折叠态源。Windows 桌面端收起时该座位**仍然挂载**(ui-sidebar 只是给
+   `footArea` 加了 `display:none`,React 组件不卸载)⇒ 探针照常发布 `wide === false`,不用另找信号。
 2. `shell.overlay`(ui-layout 声明的 frame 级浮动层,在列容器之外、z-index 20)——横条栏渲染在这里:
-   `left:0` + 垂直居中,正好落在轨道中段的空白区。**不用 `position:fixed` 挂在探针身上**:
-   祖先一旦有 transform/filter,fixed 就改成相对该祖先定位,收起动画留下的 transform 会让横条错位。
+   `left:0` + 垂直居中。宽度走 CSS 变量 `--sr-track`:轨道形态 56px,浮层形态
+   (`.sr-frame--overlay`,判据是 `<html data-windows-titlebar>`)24px。
+   **不用 `position:fixed` 挂在探针身上**:祖先一旦有 transform/filter,fixed 就改成相对该祖先定位,
+   收起动画留下的 transform 会让横条错位。
 3. 数据来自标准 props:`useSessions`(会话目录)、`useSessionStatus`(running / pendingInteraction /
    completionUnread)、`useWorkspaces`(归档集 + 工作区标题)。跳转回调与 `t` 走注册的 inject 面。
 
@@ -61,8 +65,12 @@ running 先看状态快照、再看目录行(与 ui-workspace 的 runningChildCo
 
 ## 已知边界
 
-- **只在真正还剩 56px 轨道时出图**:ui-layout 对 macOS 桌面与 Windows 标题栏桌面把收起宽度设为 0
-  (整列压平,没有空白区可放),本插件在这两种平台不出图。
+- **macOS 桌面不出图**:ui-layout 在 darwin 收起时把 sidebarCol 整个从 DOM 移除(不是压成 0),
+  既没有轨道也没有内容列左留白可压,本插件在那里返回 null。
+- **Windows 桌面端走浮层形态**:ui-layout 对 Windows 标题栏桌面把收起宽度设为 **0**
+  (`collapsedWidth = darwin || hasAttribute('data-windows-titlebar') ? 0 : 56`),整列压平。
+  本插件改成贴内容区左边缘的 24px 窄浮层 —— 实测 1280×720 最大化窗口下内容列左留白约 85px,
+  24px 只压住留白、不碰正文;窗口更窄时留白随之收窄,理论上到 24px 内边距才会开始压字。
 - **子代理只算直接子代理**:清单来自该会话自己的 `subagentCatalog` 投影(侧边栏同源);
   子代理会话自身仍不进栏(侧边栏也不列)。
 - **归档过滤依赖工作区快照**:`useWorkspaces` 缺席时退化为不过滤归档会话(并留一条控制台告警)。
@@ -84,7 +92,29 @@ running 先看状态快照、再看目录行(与 ui-workspace 的 runningChildCo
 (F5);刷新后 `sidebar.footer.action` 座位里应出现 `session-rail-probe`、`shell.overlay` 里应出现
 `session-rail`(可用 cordis_inspect_query 查 Slots 核对)。
 
-## 验收状态(2026-09-26 实机)
+## 验收状态
+
+### 2026-09-30 桌面端浮层形态(本轮新增)
+
+- 背景:本机 DSH 于 2026-09-30 从 `dsh web` 切到官方桌面端 `0.2.0-rc.2`,横条栏**在桌面端完全不出图**。
+  根因两条:`ui-layout` 对 Windows 标题栏桌面把 `collapsedWidth` 设成 **0**
+  (`darwin || hasAttribute('data-windows-titlebar') ? 0 : 56`),整列压平;而本插件原来的
+  `railExists()` 正是靠同一个 `data-windows-titlebar` 标记判"不出图"。
+- 改法:`railExists()` 只保留 darwin 的否决;新增 `overlayMode()`(判据仍是 `data-windows-titlebar`),
+  浮层形态下把轨道从 56px 收窄到 24px、贴内容区左边缘(见「实现要点」与「已知边界」)。
+- 实测(2026-09-30 18:0x,1920×1080 最大化窗口,`cordis_inspect_query` + Cua Driver 后台投递,
+  全程未抢前台):
+  - `Slots.listSubTree(root="shell.overlay")` 的 occupants 里有 `{id: "session-rail", order: 10, active: true}`;
+    `root="sidebar.footer.action"` 里有 `session-rail-probe` ⇒ 两半都注册上了。
+  - 点标题栏左侧的收起按钮后,抓屏在窗口左边缘竖排出现**两根横条**:绿色(已完成未读)在上、
+    蓝色(运行中)在下,位于 x≈30–50、垂直居中 —— 与设计一致。
+  - 同屏量到内容列左内边距 ≈196px(收起态),24px 的浮层完全落在留白里,不压正文。
+  - 单测 40/40(`node tests/derive.test.mjs`)。
+- **本轮未实测**:浮层形态下的悬停详情卡与点击跳转。原因是本机前台被别的窗口占着,
+  Cua Driver 对 `Chrome_WidgetWin_1` 的后台 hover/drag 不可用,而抢前台会打断用户正在做的事
+  (本机当时有游戏在跑)。这两条代码路径本轮未改动,浏览器形态下此前已由用户实测通过。
+
+### 2026-09-26 浏览器形态(原始验收)
 
 已实测:
 
@@ -94,7 +124,7 @@ running 先看状态快照、再看目录行(与 ui-workspace 的 runningChildCo
 - 抓屏量像素(1280×720 逻辑坐标):阻塞条 `rgb(245,158,11)` = `--dsw-static-amber-500`;
   运行中条 `rgb(79,106,153)` = 深色主题的蓝色强调色 `#7aaaff` 按呼吸动画的半透明叠加;
   两条运行条处在不同呼吸相位(动画在跑);条宽 18px = 20 CSS × 静止 0.6(与右侧索引同构)。
-- 单测 24/24(`node tests/derive.test.mjs`)。
+- 单测 37/37(`node tests/derive.test.mjs`)。
 
 **未能由我实测**(工具面限制,不是已知缺陷):点击跳转。本机浏览器窗口是
 `Chrome_WidgetWin_1`,Cua Driver 拒绝后台投递键鼠;`move_cursor` 移动真实指针后页面收不到
@@ -104,20 +134,35 @@ hover(条宽仍是静止态的 18px),而抢前台会打断用户正在做的事,
 (横条补 `onPointerLeave`/`onPointerCancel`,原先只挂了 `onBlur`,鼠标划过而没点过时收不掉);
 新增的渲染层用例会断言这两个处理函数存在,防止回归。
 
+用户实测补充(2026-09-27):点绿色"已完成未读"横条跳转后,**横条消失而详情卡留存**,
+划过别的横条才恢复 —— 已修,根因见「踩过的坑」的"卡片比横条活得久"一条。
+回归用例走 `tests/derive.test.mjs` 的 `mountRail`(带 hook 槽位、能重复渲染的 harness)。
+
 ## 开发
 
 ```
 lib/client.js          浏览器半侧(唯一有行为的文件):纯函数 + 组件 + apply
 lib/index.js           宿主半侧:空 apply(只为让加载器发现本包)
 cordis.patch.yml       profile 层 patch(一行 insert)
-tests/derive.test.mjs  纯函数单测 + apply 冒烟(node tests/derive.test.mjs,24 例)
+tests/derive.test.mjs  纯函数单测 + apply 冒烟 + 渲染层用例(node tests/derive.test.mjs,40 例)
 ```
+
+测试里有两个 React 桩:`reactStub` 无状态,只够断言"处理函数挂上了没";
+需要跨渲染的用例(详情卡在横条消失后要收掉)用 `mountRail` —— 带 hook 槽位、
+能重复渲染并在提交后冲刷 effect 的最小 harness(等价于真实 React 的 fiber 复用)。
 
 改代码后:工作区这份是 `link:` 进 profile 的(实测 profile 里是 Junction),
 改文件即时生效;但页面仍需刷新才会重新执行 bundle。
 
 ### 踩过的坑
 
+- **卡片比横条活得久**:点绿色"已完成未读"横条跳转 ⇒ `uiWorkspace.openSession` 把该会话
+  变成主视图 ⇒ ui-session 的 `reconcileStatus` 当帧清掉 `completionUnread` ⇒ 横条从行里消失。
+  指针正压在那根横条上,而横条卸载时浏览器只对**已脱离文档**的节点发 `pointerleave`,
+  React 的 `onPointerLeave` 收不到(焦点路径同理:被移除的按钮不再发 blur)⇒
+  `preview` 留在旧行上,详情卡挂着一根不存在的横条,直到划过别的横条才被换掉。
+  修法是让卡片只对"还在栏里的横条"负责:行里查不到 `preview.row.id` 就收卡片
+  (行还在、只是换档时不收,免得鼠标还停在横条上卡片却闪没)。
 - **详情卡只挂 `onBlur` 收不掉**:卡片自己是 `pointer-events:none`,收不到任何鼠标事件;
   鼠标划过横条(没点过、没聚焦)时不会触发 blur,卡片就一直挂着。横条必须自己处理
   `onPointerLeave`(顺带 `onPointerCancel`,指针被系统抢走时也要收)。
